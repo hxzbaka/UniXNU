@@ -70,12 +70,17 @@ def linux_env(ctx):
         if not path.exists():
             raise Error(f'{path} missing; run "sudo scripts/linux/setup-toolchain.py {toolchain}"')
     fakeroot = ctx.tree / '.cache/fakeroot'
+    profile = ctx.board.get('os', {}) if ctx.schema_version == 2 else {}
+    kernel_options = ctx.board.get('kernel', {})
+    ios_target = (getattr(ctx.args, 'ios_target', None)
+                  or kernel_options.get('ios_target')
+                  or ('16.0' if profile.get('xnu_version', '').startswith('8796.') else '17.0'))
     return {'PATH': os.pathsep.join([str(clt / 'bin'), str(toolchain / 'bin'), os.environ.get('PATH', '')]),
             'LC_ALL': 'C', 'CLT_PREFIX': str(clt), 'XCTOOLCHAIN_PREFIX': str(xctoolchain),
             'XNU_TOOLCHAIN_BIN': f'{clt / "bin"} {xctoolchain / "bin"}',
-            'UNIXNU_SDKROOT': str(fakeroot), 'UNIXNU_SDK_VERSION': '17.0',
+            'UNIXNU_SDKROOT': str(fakeroot), 'UNIXNU_SDK_VERSION': ios_target,
             'UNIXNU_PLATFORM_PATH': str(fakeroot / 'Platforms/iPhoneOS.platform'),
-            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': 'arm64-apple-ios17.0',
+            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': f'arm64-apple-ios{ios_target}',
             'CROSS_EXTRA_FLAGS': '-mllvm -disable-atexit-based-global-dtor-lowering',
             'CCC_OVERRIDE_OPTIONS': '# +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global'}
 
@@ -161,13 +166,27 @@ def build(ctx, modules):
         tool('xcodebuild', 'the kernel step builds with the Xcode iphoneos SDK')
     env.update(xnu_env(ctx))
     env.update(version_env(modules, ctx))
+    kernel_options = ctx.board.get('kernel', {})
+    xnu_version = env.get('UNIXNU_XNU_VERSION', '')
+    env['UNIXNU_MACHINE_CONFIG'] = (getattr(ctx.args, 'machine_config', None)
+                                    or kernel_options.get('machine_config')
+                                    or env.get('UNIXNU_MACHINE_CONFIG')
+                                    or ('PONG' if xnu_version.startswith('8796.') else 'BCM2837'))
+    env['UNIXNU_KERNEL_CONFIG'] = (getattr(ctx.args, 'kernel_config', None)
+                                   or kernel_options.get('kernel_config') or 'DEVELOPMENT')
+    env['UNIXNU_IOS_TARGET'] = (getattr(ctx.args, 'ios_target', None)
+                                or kernel_options.get('ios_target')
+                                or ('16.0' if xnu_version.startswith('8796.') else '17.0'))
+    env['UNIXNU_SDKROOT'] = kernel_options.get('sdkroot', 'iphoneos')
     if ctx.schema_version == 2:
         env['UNIXNU_PATCH_LIST'] = str(patches.prepare(ctx, modules))
         generated = ctx.tree / 'build/generated'
         generated.mkdir(parents=True, exist_ok=True)
         env['UNIXNU_GENERATED_DIR'] = str(generated)
     env['JOBS'] = str(ctx.jobs)
-    record = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json'
+    machine = env['UNIXNU_MACHINE_CONFIG']
+    configuration = env['UNIXNU_KERNEL_CONFIG']
+    record = ctx.tree / f'build/xnu/ios-obj/{configuration}_ARM64_{machine}/osfmk/{configuration}/startup.o.json'
     if not record.is_file():
         # The archive builders and the boot progress layer read compile records of the XNU build, which only an earlier
         # pass leaves behind. A first build from scratch therefore runs one pass without them; XNU_BOOTSTRAP makes it
