@@ -130,10 +130,13 @@ jobs:
       - name: Report toolchain
         run: |
           set -euo pipefail
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR"
           sw_vers
           uname -m
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
           xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --find clang
           xcrun --find iig
           for tool in git make clang cmake ninja unifdef xcodebuild; do
             command -v "$tool"
