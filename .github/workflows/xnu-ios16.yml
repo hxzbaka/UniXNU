@@ -1,0 +1,219 @@
+name: iOS 16 XNU kernel build
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository with the selected legacy XNU patches and build script
+        required: true
+        default: Chengdong-Yu/UniXNU-pong
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: main
+      defconfig:
+        description: Defconfig in the device repository
+        required: true
+        default: pong_defconfig
+      kernel_config:
+        description: XNU RELEASE / DEVELOPMENT / DEBUG
+        type: choice
+        options:
+          - DEVELOPMENT
+          - RELEASE
+          - DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: XNU MACHINE_CONFIG from the device repository
+        required: true
+        default: PONG
+      ios_target:
+        description: XNU iOS deployment target
+        required: true
+        default: "16.0"
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        type: boolean
+        default: true
+      xcode:
+        description: Xcode version installed on the macos-14 image
+        required: true
+        default: "15.4"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/unixnu/**"
+      - "scripts/build-xnu-4k-baseline.sh"
+      - ".github/workflows/xnu-ios16.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xnu-ios16-${{ github.ref }}-${{ inputs.device_repository || 'Chengdong-Yu/UniXNU-pong' }}-${{ inputs.device_ref || 'main' }}-${{ inputs.defconfig || 'pong_defconfig' }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+  DEVICE_DIR: ${{ github.workspace }}/device
+  UNIXNU_IOS_TARGET: ${{ inputs.ios_target || '16.0' }}
+  UNIXNU_MACHINE_CONFIG: ${{ inputs.machine_config || 'PONG' }}
+  UNIXNU_KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+
+jobs:
+  build:
+    # macos-14 carries Xcode 15, whose iig matches the XNU 8796 IORPC ABI.
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.device_repository || 'Chengdong-Yu/UniXNU-pong' }}
+          ref: ${{ inputs.device_ref || 'main' }}
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check inputs
+        env:
+          DEFCONFIG: ${{ inputs.defconfig || 'pong_defconfig' }}
+          XCODE_VERSION: ${{ inputs.xcode || '15.4' }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ -f device/board.toml ] || fail "device repository has no board.toml"
+          [ -f "device/configs/$DEFCONFIG" ] || fail "device/configs/$DEFCONFIG not found"
+          [ -f device/feeds.toml ] || fail "device repository must pin its Apple XNU sources in feeds.toml"
+          if [ ! -f device/scripts/build-xnu-4k-baseline.sh ] && [ ! -f scripts/build-xnu-4k-baseline.sh ]; then
+            fail "no scripts/build-xnu-4k-baseline.sh is available"
+          fi
+          XCODE_PATH=""
+          for candidate in "/Applications/Xcode_${XCODE_VERSION}.app" "/Applications/Xcode_${XCODE_VERSION}".app; do
+            if [ -d "$candidate" ]; then XCODE_PATH="$candidate"; break; fi
+          done
+          [ -n "$XCODE_PATH" ] || fail "Xcode $XCODE_VERSION is not installed on this runner"
+          case "$UNIXNU_KERNEL_CONFIG" in RELEASE|DEVELOPMENT|DEBUG) ;; *) fail "invalid kernel_config: $UNIXNU_KERNEL_CONFIG" ;; esac
+          case "$UNIXNU_IOS_TARGET" in 16|16.*) ;; *) fail "iOS 16 build expects ios_target 16.x" ;; esac
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          args = parser().parse_args(['defconfig', os.environ['DEFCONFIG'], '-D', os.environ['DEVICE_DIR']])
+          ctx = Context(args)
+          cmd_defconfig(ctx)
+          print(f"device={ctx.name}")
+          print(f"output={ctx.work}")
+          PY
+
+      - name: Install host tools
+        run: |
+          brew install cmake ninja
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --find iig
+          for tool in git make clang cmake ninja unifdef xcodebuild; do
+            command -v "$tool"
+          done
+
+      - name: Fetch pinned inputs
+        run: |
+          git submodule update --init --depth 1
+          ./unixnu fetch -D "$DEVICE_DIR"
+
+      - name: Build iOS 16 kernel with UniXNU
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == false && '' || '-k' }}
+          DEFCONFIG: ${{ inputs.defconfig || 'pong_defconfig' }}
+        run: |
+          set -euo pipefail
+          ./unixnu build kernel -D "$DEVICE_DIR" \
+            --machine-config "$UNIXNU_MACHINE_CONFIG" \
+            --kernel-config "$UNIXNU_KERNEL_CONFIG" \
+            --ios-target "$UNIXNU_IOS_TARGET"
+
+      - name: Collect sanitized text logs
+        if: always()
+        env:
+          DEFCONFIG: ${{ inputs.defconfig || 'pong_defconfig' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/public-logs"
+          [ -d out ] || exit 0
+          find out -type f -name '*.log' -print0 2>/dev/null | while IFS= read -r -d '' file; do
+            if ! grep -Iq . "$file"; then continue; fi
+            cp "$file" "$RUNNER_TEMP/public-logs/$(basename "$(dirname "$file")")-$(basename "$file")"
+          done
+
+      - name: Collect native XNU outputs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xnu-output"
+          [ -d out ] || exit 0
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          source = Path('out')
+          target = Path(__import__('os').environ['RUNNER_TEMP']) / 'xnu-output'
+          for path in source.rglob('mach.*'):
+              if path.is_file() and (path.name.endswith('.unstripped.noctf') or path.name.endswith('.unstripped') or '.' not in path.name[5:]):
+                  destination = target / path.relative_to(source)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(path, destination)
+          PY
+          find "$RUNNER_TEMP/xnu-output" -type f -print
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unixnu-ios16-${{ inputs.defconfig || 'pong_defconfig' }}-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unixnu-ios16-${{ inputs.defconfig || 'pong_defconfig' }}-kernel-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/xnu-output/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## iOS 16 XNU kernel build"
+            echo
+            echo "- Device: ${{ inputs.device_repository || 'Chengdong-Yu/UniXNU-pong' }}@${{ inputs.device_ref || 'main' }}"
+            echo "- Defconfig: ${{ inputs.defconfig || 'pong_defconfig' }}"
+            echo "- XNU machine: $UNIXNU_MACHINE_CONFIG"
+            echo "- Kernel config: $UNIXNU_KERNEL_CONFIG"
+            echo "- iOS deployment target: $UNIXNU_IOS_TARGET"
+            echo
+            echo 'The kernel was built through `./unixnu build kernel`; this workflow uploads sanitized text logs only.'
+          } >> "$GITHUB_STEP_SUMMARY"
